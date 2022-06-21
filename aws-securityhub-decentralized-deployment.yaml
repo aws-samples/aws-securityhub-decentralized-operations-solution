@@ -1,0 +1,205 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: SAM Template for security-hub-findings-enrichment
+
+Parameters:
+  SecurityToolingAccountEventBus:
+    Type: String
+    AllowedPattern: arn:(aws[a-zA-Z-]*):events:?[a-zA-Z_0-9-]+:\d{12}:event-bus/?[a-zA-Z_0-9+=,.@\-_/]+
+    Description: Event Bus Security Tooling AWS Account ID for the AWS Organizations
+    Default: arn:aws:events:us-east-1:123456789012:event-bus/myApplicationBus
+  
+  OrgManagementAccountContactRole:
+    Type: String
+    AllowedPattern: arn:(aws[a-zA-Z-]*)?:iam::\d{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+
+    Description: Role ARN in the management account to access the Alternate contact details
+    Default: arn:aws:iam::077490158405:role/account-contact-readonly
+
+Resources:
+  AccountMetadataTable:
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: accountId
+          AttributeType: S
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: accountId
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+    Type: AWS::DynamoDB::Table
+
+  SHEnrichmentFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+        Version: "2012-10-17"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  SHFindingsEnrichmentPermissionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: 
+              - securityhub:BatchUpdateFindings
+            Resource: '*'
+          - Effect: Allow
+            Action: 
+              - sts:AssumeRole
+            Resource: !Ref OrgManagementAccountContactRole
+          - Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+              - dynamodb:DescribeTable
+            Resource:
+              - !GetAtt 'AccountMetadataTable.Arn'
+      Roles:
+        - Ref: SHEnrichmentFunctionRole
+  
+  SHSupressionFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+        Version: "2012-10-17"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  SHFindingsSupressionPermissionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: 
+              - securityhub:BatchUpdateFindings
+            Resource: '*'
+      Roles:
+        - Ref: SHSupressionFunctionRole
+
+  EBCrossAccountPublishRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+        Version: "2012-10-17"
+
+  EventBridgeCrossAccountPublishPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+        - Action:
+          - events:PutEvents
+          Effect: Allow
+          Resource: !Ref SecurityToolingAccountEventBus
+        Version: '2012-10-17'
+      ManagedPolicyName: !Sub 'EventBridgeCrossAccountPublishPolicy-${AWS::StackName}'
+      Roles:
+        - Ref: EBCrossAccountPublishRole
+
+  SHEnrichmentFunction:
+    Type: AWS::Serverless::Function 
+    Properties:
+      CodeUri: enrichment_function
+      Handler: import_findings/app.lambda_handler
+      Runtime: python3.9
+      MemorySize: 128
+      Timeout: 300
+      Environment:
+        Variables:
+          ORG_ROLE: !Ref OrgManagementAccountContactRole
+          tableMetaData: !Ref 'AccountMetadataTable'
+      Architectures:
+        - x86_64
+      Role: !GetAtt SHEnrichmentFunctionRole.Arn
+      Events:
+        SHFindingRule:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - aws.securityhub
+              detail-type:
+                - Security Hub Findings - Imported
+              detail:
+                findings:
+                  RecordState:
+                    - ACTIVE
+                  UserDefinedFields:
+                    findingEnriched:
+                      - exists: false
+  
+  SHSupressionFunction:
+    Type: AWS::Serverless::Function 
+    Properties:
+      CodeUri: suppression_function
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      MemorySize: 128
+      Timeout: 300
+      Architectures:
+        - x86_64
+      Role: !GetAtt SHSupressionFunctionRole.Arn
+      Events:
+        SHFindingRule:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - aws.securityhub
+              detail-type:
+                - Security Hub Findings - Imported
+              detail:
+                findings:
+                  GeneratorId: ["PLACEHOLDER"]
+                  AwsAccountId: ["PLACEHOLDER"]
+                  RecordState:
+                    - ACTIVE
+                  Workflow:
+                    Status: ["NEW"]
+
+  
+  EventRuleToOrgDelegatedAdmin: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "Routes from OU Sec Admin to Org Sec Admin"
+      State: "ENABLED"
+      EventPattern: 
+        source:
+        - aws.securityhub
+        detail-type:
+        - Security Hub Findings - Imported
+        detail:
+          findings:
+            RecordState:
+              - ACTIVE
+            Workflow:
+              Status: ["NEW", "NOTIFIED", "RESOLVED"]
+            UserDefinedFields:
+              findingEnriched:
+                - exists: true
+      Targets: 
+        - Arn: !Ref SecurityToolingAccountEventBus
+          RoleArn: !GetAtt EBCrossAccountPublishRole.Arn
+          Id: SecHubEventsToCentralEventBus
